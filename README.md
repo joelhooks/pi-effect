@@ -84,6 +84,12 @@ When working in any repo that uses Effect:
 
 Agent-authored GitHub comments and PR reviews should come from [shitratgit[bot]](https://github.com/apps/shitratgit) when the app is installed for the repo owner. Repo creation and the initial push still need a normal GitHub token until ShitRat has installation access.
 
+## Architecture
+
+- `extensions/pi-effect.ts` is the Pi Adapter. It registers the tool, command, and prompt injection.
+- `extensions/effect-source-workspace.ts` is the Effect source workspace Module. It owns detection, mirror status, hydration, search, and repo-root keyed coordination.
+- `extensions/process-adapter.ts` is the Process Adapter seam for `git` and `rg`.
+
 ## Development
 
 ```bash

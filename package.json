@@ -29,12 +29,13 @@
   ],
   "scripts": {
     "build": "bun build ./extensions/pi-effect.ts --target=node --outfile=/tmp/pi-effect-extension.js --external @earendil-works/pi-coding-agent --external @earendil-works/pi-ai --external typebox",
-    "check": "bun run build",
+    "test": "bun test",
+    "check": "bun run build && bun test",
     "pack:dry": "npm pack --dry-run"
   },
   "pi": {
     "extensions": [
-      "./extensions"
+      "./extensions/pi-effect.ts"
     ],
     "skills": [
       "./skills"
