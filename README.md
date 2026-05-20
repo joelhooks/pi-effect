@@ -82,7 +82,7 @@ When working in any repo that uses Effect:
 
 ## GitHub actor note
 
-Agent-authored GitHub comments and PR reviews should come from [shitratgit[bot]](https://github.com/apps/shitratgit) when the app is installed for the repo owner. Repo creation and the initial push still need a normal GitHub token until ShitRat has installation access.
+Agent-authored GitHub commits, issue comments, and PR reviews should come from [shitratgit[bot]](https://github.com/apps/shitratgit) when the app is installed for the repo owner. For small agent-authored repo edits, use `shitrat commit-file` or `shitrat commit-files` instead of local `git commit && git push`.
 
 ## Architecture
 
