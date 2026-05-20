@@ -1,0 +1,48 @@
+{
+  "name": "@joelhooks/pi-effect",
+  "version": "0.1.0",
+  "description": "Pi package that enforces source-first Effect work by hydrating and searching the official Effect source in each repo.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Joel Hooks <joel@joelhooks.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/joelhooks/pi-effect.git"
+  },
+  "bugs": {
+    "url": "https://github.com/joelhooks/pi-effect/issues"
+  },
+  "homepage": "https://github.com/joelhooks/pi-effect#readme",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "effect",
+    "effect-ts",
+    "source-first"
+  ],
+  "files": [
+    "extensions",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun build ./extensions/pi-effect.ts --target=node --outfile=/tmp/pi-effect-extension.js --external @earendil-works/pi-coding-agent --external @earendil-works/pi-ai --external typebox",
+    "check": "bun run build",
+    "pack:dry": "npm pack --dry-run"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
