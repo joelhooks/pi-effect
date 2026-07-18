@@ -123,6 +123,17 @@ describe("EffectSourceWorkspace", () => {
     );
   });
 
+  test("refuses to search a mirror from the wrong exact Effect version", async () => {
+    const root = await createEffectRepo("pi-effect-version-mismatch");
+    await mkdir(join(root, ".agent-sources/effect/packages/effect/src"), { recursive: true });
+    await writeFile(join(root, ".agent-sources/effect/packages/effect/package.json"), JSON.stringify({ version: "4.0.0-beta.98" }), "utf8");
+    const workspace = createEffectSourceWorkspace({ processAdapter: new FakeProcessAdapter() });
+
+    await expect(workspace.runAction({ action: "search", query: "gen" }, root)).rejects.toThrow(
+      "Effect source version mismatch",
+    );
+  });
+
   test("refuses to search a mirror from the wrong Effect major", async () => {
     const root = await createEffectRepo("pi-effect-major-mismatch");
     await writeFile(join(root, "package.json"), JSON.stringify({ dependencies: { effect: "^3.22.0" } }), "utf8");

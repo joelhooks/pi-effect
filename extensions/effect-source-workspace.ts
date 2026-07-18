@@ -152,6 +152,7 @@ export class EffectSourceWorkspace {
     const warning = sourceVersionWarning(detection, mirror);
     if (
       warning?.startsWith("Effect source major mismatch") ||
+      warning?.startsWith("Effect source version mismatch") ||
       warning?.startsWith("Cannot resolve the Effect source branch")
     ) {
       throw new Error(warning);
@@ -331,6 +332,16 @@ function sourceVersionWarning(detection: Detection, mirror: MirrorStatus) {
   if (majors.size === 1 && mirror.major && !majors.has(mirror.major)) {
     const projectMajor = [...majors][0];
     return `Effect source major mismatch: project dependencies require v${projectMajor}, but the mirror contains ${mirror.effectVersion ?? `v${mirror.major}`}. Recreate the mirror from the ${projectMajor === 3 ? "v3" : "main"} branch before searching.`;
+  }
+
+  const exactCoreVersions = new Set(
+    detection.hits
+      .filter((hit) => hit.dependency === "effect" && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(hit.versionSpec))
+      .map((hit) => hit.versionSpec),
+  );
+  if (exactCoreVersions.size === 1 && mirror.effectVersion && !exactCoreVersions.has(mirror.effectVersion)) {
+    const projectVersion = [...exactCoreVersions][0];
+    return `Effect source version mismatch: project dependencies pin ${projectVersion}, but the mirror contains ${mirror.effectVersion}. Refresh or recreate the mirror at the project's exact source version before searching.`;
   }
   return undefined;
 }
