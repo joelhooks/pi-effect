@@ -35,10 +35,14 @@ export interface EffectSourceParams {
   force?: boolean;
 }
 
+export type EffectMajor = 3 | 4;
+
 export interface DependencyHit {
   packagePath: string;
   dependency: string;
   field: string;
+  versionSpec: string;
+  major: EffectMajor | undefined;
 }
 
 export interface Detection {
@@ -51,6 +55,8 @@ export interface MirrorStatus {
   path: string;
   exists: boolean;
   ready: boolean;
+  effectVersion: string | undefined;
+  major: EffectMajor | undefined;
 }
 
 interface DetectOptions {
@@ -94,7 +100,16 @@ export class EffectSourceWorkspace {
     const mirrorPath = join(root, this.mirrorRelative);
     const exists = await directoryExists(mirrorPath);
     const ready = exists && (await directoryExists(join(mirrorPath, "packages/effect/src")));
-    return { path: mirrorPath, exists, ready };
+    const effectVersion = ready
+      ? await readPackageVersion(join(mirrorPath, "packages/effect/package.json"))
+      : undefined;
+    return {
+      path: mirrorPath,
+      exists,
+      ready,
+      effectVersion,
+      major: effectVersion ? effectMajorFromVersionSpec(effectVersion) : undefined,
+    };
   }
 
   async hydrate(detection: Detection, signal?: AbortSignal) {
@@ -111,22 +126,35 @@ export class EffectSourceWorkspace {
 
   async statusText(detection: Detection) {
     const mirror = await this.mirrorStatus(detection.root);
+    const warning = sourceVersionWarning(detection, mirror);
     return [
       `Repo root: ${detection.root}`,
       `Uses Effect: ${detection.hits.length > 0 ? "yes" : "no"}`,
+      `Expected source branch: ${sourceBranchFor(detection) ?? "unknown"}`,
       "",
       formatDependencyHits(detection.hits),
       "",
       `Mirror: ${relative(detection.root, mirror.path)}`,
       `Mirror exists: ${mirror.exists ? "yes" : "no"}`,
       `Mirror ready: ${mirror.ready ? "yes" : "no"}`,
+      `Mirror Effect version: ${mirror.effectVersion ?? "unknown"}`,
+      ...(warning ? ["", `Warning: ${warning}`] : []),
     ].join("\n");
   }
 
   async search(detection: Detection, query: string, signal?: AbortSignal) {
-    const mirror = await this.mirrorStatus(detection.root);
+    let mirror = await this.mirrorStatus(detection.root);
     if (!mirror.ready) {
       await this.hydrate(detection, signal);
+      mirror = await this.mirrorStatus(detection.root);
+    }
+
+    const warning = sourceVersionWarning(detection, mirror);
+    if (
+      warning?.startsWith("Effect source major mismatch") ||
+      warning?.startsWith("Cannot resolve the Effect source branch")
+    ) {
+      throw new Error(warning);
     }
 
     const result = await this.processAdapter.search({
@@ -180,7 +208,7 @@ export class EffectSourceWorkspace {
 
 # Effect source rule (pi-effect)
 
-This repo uses Effect. Before writing, reviewing, or refactoring Effect code, reference the official Effect source mirror at \`${this.mirrorRelative}\`. If the mirror is missing, use the \`effect_source\` tool with action \`hydrate\` first. Search source, tests, and examples before calling anything an Effect best practice. Do not rely on stale memory or blog snippets.
+This repo uses Effect. Before writing, reviewing, or refactoring Effect code, run \`effect_source\` with action \`status\` and verify the official source mirror at \`${this.mirrorRelative}\` matches the project's Effect major. Canonical \`main\` is Effect v4; Effect v3 lives on the upstream \`v3\` branch. If the mirror is missing, use action \`hydrate\` first. Search source, tests, and examples before calling anything an Effect best practice. Do not rely on stale memory or blog snippets.
 `;
   }
 
@@ -205,10 +233,13 @@ This repo uses Effect. Before writing, reviewing, or refactoring Effect code, re
 
         for (const dependency of Object.keys(deps as Record<string, unknown>)) {
           if (dependency === "effect" || dependency.startsWith("@effect/")) {
+            const versionSpec = String((deps as Record<string, unknown>)[dependency]);
             hits.push({
               packagePath: relative(root, packageFile),
               dependency,
               field,
+              versionSpec,
+              major: effectMajorFromVersionSpec(versionSpec),
             });
           }
         }
@@ -228,10 +259,18 @@ This repo uses Effect. Before writing, reviewing, or refactoring Effect code, re
     }
 
     await mkdir(join(detection.root, dirname(this.mirrorRelative)), { recursive: true });
+    const branch = sourceBranchFor(detection);
+    if (!branch) {
+      throw new Error(
+        "Cannot resolve the Effect source branch from floating or aliased dependency specs. Pin Effect exactly before hydrating source.",
+      );
+    }
+
     await this.processAdapter.cloneShallow({
       cwd: detection.root,
       repoUrl: this.effectRepoUrl,
       target: this.mirrorRelative,
+      branch,
       signal,
     });
   }
@@ -260,7 +299,49 @@ export function createEffectSourceWorkspace(options?: WorkspaceOptions) {
 
 function formatDependencyHits(hits: DependencyHit[]) {
   if (hits.length === 0) return "No Effect dependencies found.";
-  return hits.map((hit) => `- ${hit.packagePath}: ${hit.field}.${hit.dependency}`).join("\n");
+  return hits
+    .map((hit) => `- ${hit.packagePath}: ${hit.dependency} (${hit.field}): ${hit.versionSpec}`)
+    .join("\n");
+}
+
+function effectMajorFromVersionSpec(versionSpec: string): EffectMajor | undefined {
+  if (versionSpec === "beta" || /(?:^|[^0-9])4\./.test(versionSpec)) return 4;
+  if (/(?:^|[^0-9])3\./.test(versionSpec)) return 3;
+  return undefined;
+}
+
+function detectedMajors(detection: Detection) {
+  return new Set(detection.hits.flatMap((hit) => (hit.major ? [hit.major] : [])));
+}
+
+function sourceBranchFor(detection: Detection): "main" | "v3" | undefined {
+  const majors = detectedMajors(detection);
+  if (majors.size === 0 && detection.hits.length > 0) return undefined;
+  return majors.size === 1 && majors.has(3) ? "v3" : "main";
+}
+
+function sourceVersionWarning(detection: Detection, mirror: MirrorStatus) {
+  const majors = detectedMajors(detection);
+  if (detection.hits.some((hit) => hit.major === undefined)) {
+    return "Cannot resolve the Effect source branch from floating or aliased dependency specs. Pin Effect exactly before hydrating or searching source.";
+  }
+  if (majors.size > 1) {
+    return `Mixed Effect majors detected. The shared mirror is Effect ${mirror.effectVersion ?? "unknown"}; inspect each package's exact installed source before copying APIs.`;
+  }
+  if (majors.size === 1 && mirror.major && !majors.has(mirror.major)) {
+    const projectMajor = [...majors][0];
+    return `Effect source major mismatch: project dependencies require v${projectMajor}, but the mirror contains ${mirror.effectVersion ?? `v${mirror.major}`}. Recreate the mirror from the ${projectMajor === 3 ? "v3" : "main"} branch before searching.`;
+  }
+  return undefined;
+}
+
+async function readPackageVersion(packagePath: string) {
+  try {
+    const parsed = JSON.parse(await readFile(packagePath, "utf8")) as { version?: unknown };
+    return typeof parsed.version === "string" ? parsed.version : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function pathExists(path: string) {

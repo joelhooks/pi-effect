@@ -9,7 +9,7 @@ This package makes that the default instead of a sticky note we hope the agent r
 ## What it does
 
 - Detects `effect` / `@effect/*` dependencies in `package.json` files.
-- Hydrates the official Effect repo into `.agent-sources/effect/` with a shallow clone.
+- Hydrates the official Effect repo into `.agent-sources/effect/` with a version-aware shallow clone: canonical `main` for v4, upstream `v3` for explicit v3 projects.
 - Adds `.agent-sources/` to `.git/info/exclude` so the mirror stays out of product commits.
 - Injects a source-first Effect rule into Pi's system prompt when the current repo uses Effect.
 - Provides an `effect_source` tool for status, hydrate, and source search.
@@ -42,9 +42,9 @@ pi install git:github.com/joelhooks/pi-effect
 
 The extension registers `effect_source`:
 
-- `status` - report whether the current repo uses Effect and whether the source mirror exists
-- `hydrate` - clone `.agent-sources/effect/` if needed and exclude it locally
-- `search` - run `rg` against the Effect source mirror
+- `status` - report dependency specs, expected source branch, mirror readiness, mirror Effect version, and major mismatches
+- `hydrate` - clone `.agent-sources/effect/` from canonical `main` for v4 or upstream `v3` for explicit v3 projects, then exclude it locally
+- `search` - run `rg` against the Effect source mirror and refuse a known major mismatch or unresolved floating spec
 
 ## Source-first repo setup
 
@@ -74,10 +74,14 @@ When working in any repo that uses Effect:
 
    ```bash
    mkdir -p .agent-sources
-   git clone --depth 1 --filter=blob:none https://github.com/effect-ts/effect.git .agent-sources/effect
+   # Effect v4
+   git clone --depth 1 --filter=blob:none --branch main https://github.com/effect-ts/effect.git .agent-sources/effect
+
+   # Effect v3 projects use --branch v3 instead.
    ```
 
-3. Add `.agent-sources/` to `.git/info/exclude`.
+3. Pin Effect exactly. Floating aliases such as `latest` cannot choose a trustworthy source branch offline.
+4. Add `.agent-sources/` to `.git/info/exclude`.
 4. Search `packages/effect/src/`, tests, and examples before claiming anything is an Effect best practice.
 
 ## GitHub actor note

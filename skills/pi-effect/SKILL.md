@@ -9,13 +9,16 @@ Use this skill for any Effect work. The rule is simple: source first, opinions s
 
 ## Required workflow
 
-1. Confirm the current repo uses Effect by checking package/dependency files for `effect` or `@effect/*`.
-2. Check for `.agent-sources/effect/` at the repo root.
-3. If missing, hydrate the source mirror:
+1. Confirm the current repo uses Effect by checking package/dependency files for `effect` or `@effect/*`. Require an exact Effect version; floating aliases such as `latest` cannot choose a trustworthy source branch offline.
+2. Run `effect_source` status and verify the mirror major matches the project. Canonical `main` is Effect v4; Effect v3 lives on the upstream `v3` branch.
+3. Check for `.agent-sources/effect/` at the repo root. If missing, hydrate the source mirror:
 
    ```bash
    mkdir -p .agent-sources
-   git clone --depth 1 --filter=blob:none https://github.com/effect-ts/effect.git .agent-sources/effect
+   # Effect v4
+   git clone --depth 1 --filter=blob:none --branch main https://github.com/effect-ts/effect.git .agent-sources/effect
+
+   # Effect v3 projects use --branch v3 instead.
    ```
 
 4. Keep the mirror out of product commits:
@@ -34,9 +37,9 @@ Use this skill for any Effect work. The rule is simple: source first, opinions s
 
 Prefer the tool over hand-rolled commands:
 
-- `status` first
+- `status` first; stop on a source-major mismatch or unresolved floating spec
 - `hydrate` before edits if the mirror is missing
-- `search` for current source evidence
+- `search` for current source evidence; it refuses a known source-major mismatch
 
 ## What counts as evidence
 

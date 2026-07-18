@@ -30,6 +30,7 @@ export interface SourceProcessAdapter {
     cwd: string;
     repoUrl: string;
     target: string;
+    branch: "main" | "v3";
     signal?: AbortSignal;
   }): Promise<void>;
   search(args: {
@@ -125,8 +126,8 @@ export function createNodeProcessAdapter(): SourceProcessAdapter {
       return resolve(root, result.stdout.trim());
     },
 
-    async cloneShallow({ cwd, repoUrl, target, signal }) {
-      const args = ["clone", "--depth", "1", "--filter=blob:none", repoUrl, target];
+    async cloneShallow({ cwd, repoUrl, target, branch, signal }) {
+      const args = ["clone", "--depth", "1", "--filter=blob:none", "--branch", branch, repoUrl, target];
       const result = await run("git", args, { cwd, signal, maxBytes: 100_000 });
       if (result.code !== 0) throw commandFailure("git", args, result, "Source clone failed");
     },
@@ -138,10 +139,10 @@ export function createNodeProcessAdapter(): SourceProcessAdapter {
         String(contextLines),
         "--max-count",
         String(maxCountPerFile),
+        ...globs.flatMap((glob) => ["-g", glob]),
         "--",
         query,
         ...paths,
-        ...globs.flatMap((glob) => ["-g", glob]),
       ];
 
       const result = await run("rg", args, { cwd, signal, maxBytes });
