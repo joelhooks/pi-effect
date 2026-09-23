@@ -1,22 +1,28 @@
 import { constants } from "node:fs";
-import { access, appendFile, mkdir, readFile, readdir, stat } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { access, appendFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { dirname, join, relative, resolve, sep } from "node:path";
+import { minimatch } from "minimatch";
+import { parse as parseYaml } from "yaml";
 import { createNodeProcessAdapter, type SourceProcessAdapter } from "./process-adapter.ts";
 
-export const EFFECT_REPO_URL = "https://github.com/effect-ts/effect.git";
-export const EFFECT_MIRROR_RELATIVE = ".agent-sources/effect";
-export const EFFECT_EXCLUDE_ENTRY = ".agent-sources/";
+export const EFFECT_REPO_URL = "https://github.com/Effect-TS/effect.git";
+export const EFFECT_MIRROR_RELATIVE = ".agent_sources/github.com/Effect-TS/effect";
+export const LEGACY_EFFECT_MIRROR_RELATIVE = ".agent-sources/effect";
+export const EFFECT_EXCLUDE_ENTRIES = [".agent_sources/", ".agent-sources/", ".agent-source/"] as const;
 
+const EFFECT_OWNER = "Effect-TS";
+const EFFECT_REPO = "effect";
+const EFFECT_METADATA_FILE = ".agent-source.json";
 const packageDependencyFields = [
   "dependencies",
   "devDependencies",
   "peerDependencies",
   "optionalDependencies",
 ] as const;
-
 const skippedDirectories = new Set([
   ".agent-source",
   ".agent-sources",
+  ".agent_sources",
   ".git",
   ".next",
   ".turbo",
@@ -28,6 +34,9 @@ const skippedDirectories = new Set([
 ]);
 
 export type EffectAction = "status" | "hydrate" | "search";
+export type EffectMajor = 3 | 4;
+type MirrorLayout = "rat-stack" | "legacy" | "missing";
+type MetadataState = "valid" | "missing" | "invalid";
 
 export interface EffectSourceParams {
   action: EffectAction;
@@ -35,13 +44,12 @@ export interface EffectSourceParams {
   force?: boolean;
 }
 
-export type EffectMajor = 3 | 4;
-
 export interface DependencyHit {
   packagePath: string;
   dependency: string;
   field: string;
   versionSpec: string;
+  resolvedVersionSpec: string;
   major: EffectMajor | undefined;
 }
 
@@ -53,10 +61,13 @@ export interface Detection {
 
 export interface MirrorStatus {
   path: string;
+  layout: MirrorLayout;
   exists: boolean;
   ready: boolean;
   effectVersion: string | undefined;
   major: EffectMajor | undefined;
+  sourceRef: string | undefined;
+  metadataState: MetadataState;
 }
 
 interface DetectOptions {
@@ -68,14 +79,41 @@ interface WorkspaceOptions {
   processAdapter?: SourceProcessAdapter;
   effectRepoUrl?: string;
   mirrorRelative?: string;
-  excludeEntry?: string;
+  legacyMirrorRelative?: string;
+}
+
+interface SourceRefResolution {
+  ref: string | undefined;
+  major: EffectMajor | undefined;
+  exactVersion: string | undefined;
+  warning: string | undefined;
+}
+
+interface SourceWarning {
+  message: string;
+  blocksSearch: boolean;
+}
+
+interface WorkspaceManifest {
+  packagePatterns: string[];
+  defaultCatalog: Record<string, string>;
+  namedCatalogs: Record<string, Record<string, string>>;
+}
+
+interface AgentSourceMetadata {
+  type: "github-repo-source";
+  owner: string;
+  repo: string;
+  remote: string;
+  ref: string;
+  commit: string;
 }
 
 export class EffectSourceWorkspace {
   private readonly processAdapter: SourceProcessAdapter;
   private readonly effectRepoUrl: string;
   private readonly mirrorRelative: string;
-  private readonly excludeEntry: string;
+  private readonly legacyMirrorRelative: string;
   private readonly detectionCache = new Map<string, Promise<Detection>>();
   private readonly hydrationByRoot = new Map<string, Promise<void>>();
 
@@ -83,7 +121,7 @@ export class EffectSourceWorkspace {
     this.processAdapter = options.processAdapter ?? createNodeProcessAdapter();
     this.effectRepoUrl = options.effectRepoUrl ?? EFFECT_REPO_URL;
     this.mirrorRelative = options.mirrorRelative ?? EFFECT_MIRROR_RELATIVE;
-    this.excludeEntry = options.excludeEntry ?? EFFECT_EXCLUDE_ENTRY;
+    this.legacyMirrorRelative = options.legacyMirrorRelative ?? LEGACY_EFFECT_MIRROR_RELATIVE;
   }
 
   async detect(cwd: string, options: DetectOptions = {}): Promise<Detection> {
@@ -97,26 +135,36 @@ export class EffectSourceWorkspace {
   }
 
   async mirrorStatus(root: string): Promise<MirrorStatus> {
-    const mirrorPath = join(root, this.mirrorRelative);
-    const exists = await directoryExists(mirrorPath);
+    const currentPath = join(root, this.mirrorRelative);
+    const legacyPath = join(root, this.legacyMirrorRelative);
+    const currentExists = await directoryExists(currentPath);
+    const legacyExists = !currentExists && (await directoryExists(legacyPath));
+    const mirrorPath = currentExists ? currentPath : legacyExists ? legacyPath : currentPath;
+    const layout: MirrorLayout = currentExists ? "rat-stack" : legacyExists ? "legacy" : "missing";
+    const exists = currentExists || legacyExists;
     const ready = exists && (await directoryExists(join(mirrorPath, "packages/effect/src")));
     const effectVersion = ready
       ? await readPackageVersion(join(mirrorPath, "packages/effect/package.json"))
       : undefined;
+    const metadata = exists ? await readAgentSourceMetadata(join(mirrorPath, EFFECT_METADATA_FILE)) : undefined;
+
     return {
       path: mirrorPath,
+      layout,
       exists,
       ready,
       effectVersion,
       major: effectVersion ? effectMajorFromVersionSpec(effectVersion) : undefined,
+      sourceRef: metadata?.ref,
+      metadataState: !exists || layout === "legacy" ? "missing" : metadata ? "valid" : "invalid",
     };
   }
 
-  async hydrate(detection: Detection, signal?: AbortSignal) {
+  async hydrate(detection: Detection, signal?: AbortSignal, force = false) {
     const inFlight = this.hydrationByRoot.get(detection.root);
     if (inFlight) return inFlight;
 
-    const hydrate = this.hydrateRoot(detection, signal).finally(() => {
+    const hydrate = this.hydrateRoot(detection, signal, force).finally(() => {
       this.hydrationByRoot.delete(detection.root);
     });
 
@@ -124,47 +172,47 @@ export class EffectSourceWorkspace {
     return hydrate;
   }
 
-  async statusText(detection: Detection) {
+  async statusText(detection: Detection, force = false) {
     const mirror = await this.mirrorStatus(detection.root);
-    const warning = sourceVersionWarning(detection, mirror);
+    const resolution = sourceRefFor(detection, force);
+    const warnings = sourceWarnings(detection, mirror, force);
+    const expectedRef = resolution.ref
+      ? `${resolution.ref} (${resolution.exactVersion ? "exact pin" : "major-branch fallback"})`
+      : "unknown";
+
     return [
       `Repo root: ${detection.root}`,
       `Uses Effect: ${detection.hits.length > 0 ? "yes" : "no"}`,
-      `Expected source branch: ${sourceBranchFor(detection) ?? "unknown"}`,
+      `Expected source ref: ${expectedRef}`,
       "",
       formatDependencyHits(detection.hits),
       "",
       `Mirror: ${relative(detection.root, mirror.path)}`,
+      `Mirror layout: ${mirror.layout}`,
       `Mirror exists: ${mirror.exists ? "yes" : "no"}`,
       `Mirror ready: ${mirror.ready ? "yes" : "no"}`,
+      `Mirror source ref: ${mirror.sourceRef ?? "not recorded"}`,
       `Mirror Effect version: ${mirror.effectVersion ?? "unknown"}`,
-      ...(warning ? ["", `Warning: ${warning}`] : []),
+      ...(warnings.length > 0 ? ["", ...warnings.map((warning) => `Warning: ${warning.message}`)] : []),
     ].join("\n");
   }
 
-  async search(detection: Detection, query: string, signal?: AbortSignal) {
+  async search(detection: Detection, query: string, signal?: AbortSignal, force = false) {
     let mirror = await this.mirrorStatus(detection.root);
-    if (!mirror.ready) {
-      await this.hydrate(detection, signal);
+    const currentWarnings = sourceWarnings(detection, mirror, force);
+    if (!mirror.ready || (mirror.layout === "legacy" && currentWarnings.some((warning) => warning.blocksSearch))) {
+      await this.hydrate(detection, signal, force);
       mirror = await this.mirrorStatus(detection.root);
     }
 
-    const warning = sourceVersionWarning(detection, mirror);
-    if (
-      warning?.startsWith("Effect source major mismatch") ||
-      warning?.startsWith("Effect source version mismatch") ||
-      warning?.startsWith("Cannot resolve the Effect source branch")
-    ) {
-      throw new Error(warning);
-    }
+    const blockingWarning = sourceWarnings(detection, mirror, force).find((warning) => warning.blocksSearch);
+    if (blockingWarning) throw new Error(blockingWarning.message);
 
+    const mirrorRelative = relative(detection.root, mirror.path);
     const result = await this.processAdapter.search({
       cwd: detection.root,
       query,
-      paths: [
-        join(this.mirrorRelative, "packages/effect/src"),
-        join(this.mirrorRelative, "packages"),
-      ],
+      paths: [join(mirrorRelative, "packages/effect/src"), join(mirrorRelative, "packages")],
       globs: ["*.ts", "*.md", "!**/node_modules/**"],
       contextLines: 2,
       maxCountPerFile: 20,
@@ -179,7 +227,7 @@ export class EffectSourceWorkspace {
     const detection = await this.detect(cwd, { refresh: true, signal });
 
     if (params.action === "status") {
-      return this.statusText(detection);
+      return this.statusText(detection, params.force);
     }
 
     if (params.action === "hydrate") {
@@ -187,8 +235,8 @@ export class EffectSourceWorkspace {
         return `${await this.statusText(detection)}\n\nSkipped hydrate because no Effect dependency was found. Pass force=true if this repo is weird.`;
       }
 
-      await this.hydrate(detection, signal);
-      return `${await this.statusText(detection)}\n\nHydrated Effect source mirror.`;
+      await this.hydrate(detection, signal, params.force);
+      return `${await this.statusText(detection, params.force)}\n\nEffect source mirror is ready.`;
     }
 
     if (params.action === "search") {
@@ -198,7 +246,7 @@ export class EffectSourceWorkspace {
         return `${await this.statusText(detection)}\n\nSkipped search because no Effect dependency was found. Pass force=true if this repo is weird.`;
       }
 
-      return this.search(detection, query, signal);
+      return this.search(detection, query, signal, params.force);
     }
 
     throw new Error(`Unknown effect_source action: ${params.action satisfies never}`);
@@ -209,40 +257,41 @@ export class EffectSourceWorkspace {
 
 # Effect source rule (pi-effect)
 
-This repo uses Effect. Before writing, reviewing, or refactoring Effect code, run \`effect_source\` with action \`status\` and verify the official source mirror at \`${this.mirrorRelative}\` matches the project's Effect major. Canonical \`main\` is Effect v4; Effect v3 lives on the upstream \`v3\` branch. If the mirror is missing, use action \`hydrate\` first. Search source, tests, and examples before calling anything an Effect best practice. Do not rely on stale memory or blog snippets.
+This repo uses Effect. Before writing, reviewing, or refactoring Effect code, run \`effect_source\` with action \`status\` and verify the source ref and mirror version match the project's Effect pin. The canonical mirror is \`${this.mirrorRelative}\`; existing projects may still use \`${this.legacyMirrorRelative}\`. Exact pins resolve to their matching \`effect@<version>\` tag. A \`main\` or \`v3\` ref is a major-branch fallback, not an exact version match. If the mirror is missing, use action \`hydrate\` first. Search source, tests, and examples before calling anything an Effect best practice.
 `;
   }
 
   private async createDetection(root: string, isGitRepo: boolean): Promise<Detection> {
-    const packageFiles = await findPackageJsonFiles(root, isGitRepo);
+    const workspace = await readWorkspaceManifest(root);
+    const packageFiles = await findPackageJsonFiles(root, workspace.packagePatterns);
     const hits: DependencyHit[] = [];
 
     for (const packageFile of packageFiles) {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(await readFile(packageFile, "utf8"));
-      } catch {
-        continue;
-      }
-
-      if (!parsed || typeof parsed !== "object") continue;
-      const packageJson = parsed as Record<string, unknown>;
+      const packageJson = await readJsonRecord(packageFile);
+      if (!packageJson) continue;
 
       for (const field of packageDependencyFields) {
-        const deps = packageJson[field];
-        if (!deps || typeof deps !== "object") continue;
+        const deps = asRecord(packageJson[field]);
+        if (!deps) continue;
 
-        for (const dependency of Object.keys(deps as Record<string, unknown>)) {
-          if (dependency === "effect" || dependency.startsWith("@effect/")) {
-            const versionSpec = String((deps as Record<string, unknown>)[dependency]);
-            hits.push({
-              packagePath: relative(root, packageFile),
-              dependency,
-              field,
-              versionSpec,
-              major: effectMajorFromVersionSpec(versionSpec),
-            });
-          }
+        for (const dependency of Object.keys(deps)) {
+          if (dependency !== "effect" && !dependency.startsWith("@effect/")) continue;
+
+          const versionSpec = String(deps[dependency]);
+          const resolvedVersionSpec = resolveCatalogSpec(
+            versionSpec,
+            dependency,
+            workspace.defaultCatalog,
+            workspace.namedCatalogs,
+          );
+          hits.push({
+            packagePath: relative(root, packageFile),
+            dependency,
+            field,
+            versionSpec,
+            resolvedVersionSpec,
+            major: effectMajorFromVersionSpec(resolvedVersionSpec),
+          });
         }
       }
     }
@@ -250,30 +299,50 @@ This repo uses Effect. Before writing, reviewing, or refactoring Effect code, ru
     return { root, isGitRepo, hits };
   }
 
-  private async hydrateRoot(detection: Detection, signal?: AbortSignal) {
+  private async hydrateRoot(detection: Detection, signal?: AbortSignal, force = false) {
     await this.ensureExcluded(detection.root, detection.isGitRepo, signal);
 
+    const resolution = sourceRefFor(detection, force);
+    if (!resolution.ref) {
+      throw new Error(resolution.warning ?? "Cannot resolve an Effect source ref.");
+    }
+
     const mirror = await this.mirrorStatus(detection.root);
-    if (mirror.ready) return;
-    if (mirror.exists && !mirror.ready) {
-      throw new Error(`${this.mirrorRelative} exists but does not look like the Effect repo.`);
+    if (mirror.ready) {
+      const blockingWarning = sourceWarnings(detection, mirror, force).find((warning) => warning.blocksSearch);
+      if (!blockingWarning) return;
+      if (mirror.layout !== "legacy") {
+        throw new Error(`${blockingWarning.message} Existing mirrors are left untouched; inspect or replace the mirror explicitly.`);
+      }
+    }
+    if (mirror.exists && mirror.layout !== "legacy") {
+      throw new Error(`${relative(detection.root, mirror.path)} exists but does not look like the Effect repo.`);
     }
 
     await mkdir(join(detection.root, dirname(this.mirrorRelative)), { recursive: true });
-    const branch = sourceBranchFor(detection);
-    if (!branch) {
-      throw new Error(
-        "Cannot resolve the Effect source branch from floating or aliased dependency specs. Pin Effect exactly before hydrating source.",
-      );
-    }
-
-    await this.processAdapter.cloneShallow({
+    const result = await this.processAdapter.cloneShallow({
       cwd: detection.root,
       repoUrl: this.effectRepoUrl,
       target: this.mirrorRelative,
-      branch,
+      ref: resolution.ref,
       signal,
     });
+
+    const metadata: AgentSourceMetadata & { addedAt: string; note: string } = {
+      type: "github-repo-source",
+      owner: EFFECT_OWNER,
+      repo: EFFECT_REPO,
+      remote: this.effectRepoUrl,
+      ref: resolution.ref,
+      commit: result.commit,
+      addedAt: new Date().toISOString(),
+      note: "Pi Effect source mirror. Refresh from the project's Effect pin.",
+    };
+    await writeFile(join(detection.root, this.mirrorRelative, EFFECT_METADATA_FILE), `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+
+    const hydrated = await this.mirrorStatus(detection.root);
+    const blockingWarning = sourceWarnings(detection, hydrated, force).find((warning) => warning.blocksSearch);
+    if (blockingWarning) throw new Error(blockingWarning.message);
   }
 
   private async ensureExcluded(root: string, isGitRepo: boolean, signal?: AbortSignal) {
@@ -286,8 +355,9 @@ This repo uses Effect. Before writing, reviewing, or refactoring Effect code, ru
       .split(/\r?\n/)
       .map((line) => line.trim());
 
-    if (!current.includes(this.excludeEntry)) {
-      await appendFile(excludePath, `${current.length > 0 ? "\n" : ""}${this.excludeEntry}\n`, "utf8");
+    const missingEntries = EFFECT_EXCLUDE_ENTRIES.filter((entry) => !current.includes(entry));
+    if (missingEntries.length > 0) {
+      await appendFile(excludePath, `${current.some(Boolean) ? "\n" : ""}${missingEntries.join("\n")}\n`, "utf8");
     }
 
     return excludePath;
@@ -301,86 +371,209 @@ export function createEffectSourceWorkspace(options?: WorkspaceOptions) {
 function formatDependencyHits(hits: DependencyHit[]) {
   if (hits.length === 0) return "No Effect dependencies found.";
   return hits
-    .map((hit) => `- ${hit.packagePath}: ${hit.dependency} (${hit.field}): ${hit.versionSpec}`)
+    .map((hit) => {
+      const spec = hit.versionSpec === hit.resolvedVersionSpec
+        ? hit.versionSpec
+        : `${hit.versionSpec} -> ${hit.resolvedVersionSpec}`;
+      return `- ${hit.packagePath}: ${hit.dependency} (${hit.field}): ${spec}`;
+    })
     .join("\n");
 }
 
-function effectMajorFromVersionSpec(versionSpec: string): EffectMajor | undefined {
-  if (versionSpec === "beta" || /(?:^|[^0-9])4\./.test(versionSpec)) return 4;
-  if (/(?:^|[^0-9])3\./.test(versionSpec)) return 3;
-  return undefined;
-}
-
-function detectedMajors(detection: Detection) {
-  return new Set(detection.hits.flatMap((hit) => (hit.major ? [hit.major] : [])));
-}
-
-function sourceBranchFor(detection: Detection): "main" | "v3" | undefined {
-  const majors = detectedMajors(detection);
-  if (majors.size === 0 && detection.hits.length > 0) return undefined;
-  return majors.size === 1 && majors.has(3) ? "v3" : "main";
-}
-
-function sourceVersionWarning(detection: Detection, mirror: MirrorStatus) {
-  const majors = detectedMajors(detection);
-  if (detection.hits.some((hit) => hit.major === undefined)) {
-    return "Cannot resolve the Effect source branch from floating or aliased dependency specs. Pin Effect exactly before hydrating or searching source.";
-  }
-  if (majors.size > 1) {
-    return `Mixed Effect majors detected. The shared mirror is Effect ${mirror.effectVersion ?? "unknown"}; inspect each package's exact installed source before copying APIs.`;
-  }
-  if (majors.size === 1 && mirror.major && !majors.has(mirror.major)) {
-    const projectMajor = [...majors][0];
-    return `Effect source major mismatch: project dependencies require v${projectMajor}, but the mirror contains ${mirror.effectVersion ?? `v${mirror.major}`}. Recreate the mirror from the ${projectMajor === 3 ? "v3" : "main"} branch before searching.`;
+function sourceRefFor(detection: Detection, force = false): SourceRefResolution {
+  const detectedMajors = new Set(detection.hits.flatMap((hit) => (hit.major ? [hit.major] : [])));
+  if (detectedMajors.size > 1) {
+    return {
+      ref: undefined,
+      major: undefined,
+      exactVersion: undefined,
+      warning: `Mixed Effect majors detected (${[...detectedMajors].map((major) => `v${major}`).join(", ")}); one source mirror cannot represent both.`,
+    };
   }
 
-  const exactCoreVersions = new Set(
+  const coreExactVersions = new Set(
     detection.hits
-      .filter((hit) => hit.dependency === "effect" && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(hit.versionSpec))
-      .map((hit) => hit.versionSpec),
+      .filter((hit) => hit.dependency === "effect" && isExactVersion(hit.resolvedVersionSpec))
+      .map((hit) => hit.resolvedVersionSpec),
   );
-  if (exactCoreVersions.size === 1 && mirror.effectVersion && !exactCoreVersions.has(mirror.effectVersion)) {
-    const projectVersion = [...exactCoreVersions][0];
-    return `Effect source version mismatch: project dependencies pin ${projectVersion}, but the mirror contains ${mirror.effectVersion}. Refresh or recreate the mirror at the project's exact source version before searching.`;
+  if (coreExactVersions.size === 1) {
+    const exactVersion = [...coreExactVersions][0];
+    return { ref: `effect@${exactVersion}`, major: effectMajorFromVersionSpec(exactVersion), exactVersion, warning: undefined };
   }
+  if (coreExactVersions.size > 1) {
+    return {
+      ref: undefined,
+      major: undefined,
+      exactVersion: undefined,
+      warning: `Multiple exact effect versions are used (${[...coreExactVersions].join(", ")}); one source mirror cannot represent both.`,
+    };
+  }
+
+  const exactVersions = new Set(
+    detection.hits
+      .filter((hit) => hit.major !== undefined && isExactVersion(hit.resolvedVersionSpec))
+      .map((hit) => hit.resolvedVersionSpec),
+  );
+  if (exactVersions.size === 1) {
+    const exactVersion = [...exactVersions][0];
+    return { ref: `effect@${exactVersion}`, major: effectMajorFromVersionSpec(exactVersion), exactVersion, warning: undefined };
+  }
+  if (exactVersions.size > 1) {
+    return {
+      ref: undefined,
+      major: undefined,
+      exactVersion: undefined,
+      warning: `Multiple exact Effect package versions are used (${[...exactVersions].join(", ")}); one source mirror cannot represent both.`,
+    };
+  }
+
+  const majors = detectedMajors;
+  const unresolved = detection.hits.filter((hit) => hit.major === undefined);
+  if (majors.size === 1 && unresolved.length === 0) {
+    const major = [...majors][0];
+    const ref = major === 3 ? "v3" : "main";
+    return {
+      ref,
+      major,
+      exactVersion: undefined,
+      warning: `No exact Effect version pin was found; using ${ref} as a v${major} branch fallback.`,
+    };
+  }
+  if (detection.hits.length === 0) {
+    return force
+      ? {
+          ref: "main",
+          major: 4,
+          exactVersion: undefined,
+          warning: "No Effect dependency was detected; using main only because force=true.",
+        }
+      : { ref: undefined, major: undefined, exactVersion: undefined, warning: undefined };
+  }
+
+  return {
+    ref: undefined,
+    major: undefined,
+    exactVersion: undefined,
+    warning: `Cannot resolve an Effect source ref from ${unresolved.map((hit) => `${hit.dependency}=${hit.versionSpec}`).join(", ") || "the detected dependency specs"}. Resolve catalog entries or pin Effect exactly before hydrating or searching source.`,
+  };
+}
+
+function sourceWarnings(detection: Detection, mirror: MirrorStatus, force = false): SourceWarning[] {
+  const resolution = sourceRefFor(detection, force);
+  const warnings: SourceWarning[] = [];
+  if (resolution.warning) {
+    warnings.push({
+      message: resolution.warning,
+      blocksSearch: !resolution.ref,
+    });
+  }
+  if (!mirror.ready) return warnings;
+
+  if (resolution.exactVersion && mirror.effectVersion !== resolution.exactVersion) {
+    warnings.push({
+      message: `Effect source version mismatch: project pins ${resolution.exactVersion}, but the mirror contains ${mirror.effectVersion ?? "an unknown version"}.`,
+      blocksSearch: true,
+    });
+  }
+  if (resolution.exactVersion && mirror.sourceRef && mirror.sourceRef !== resolution.ref) {
+    warnings.push({
+      message: `Effect source ref mismatch: project expects ${resolution.ref}, but mirror metadata records ${mirror.sourceRef}.`,
+      blocksSearch: true,
+    });
+  }
+  if (resolution.major && mirror.major && resolution.major !== mirror.major) {
+    warnings.push({
+      message: `Effect source major mismatch: project dependencies require v${resolution.major}, but the mirror contains ${mirror.effectVersion ?? `v${mirror.major}`}.`,
+      blocksSearch: true,
+    });
+  }
+  if (mirror.metadataState !== "valid") {
+    const reason = mirror.metadataState === "missing" ? "has no .agent-source.json ref metadata" : "has invalid .agent-source.json metadata";
+    warnings.push({
+      message: `Effect mirror ${reason}; its source ref cannot be verified.`,
+      blocksSearch: false,
+    });
+  }
+  if (mirror.layout === "legacy") {
+    warnings.push({
+      message: `Using legacy mirror path ${LEGACY_EFFECT_MIRROR_RELATIVE}; new mirrors use ${EFFECT_MIRROR_RELATIVE}.`,
+      blocksSearch: false,
+    });
+  }
+  return warnings;
+}
+
+function effectMajorFromVersionSpec(versionSpec: string): EffectMajor | undefined {
+  const match = /^(?:[~^<>=]|\s)*(?:v)?([34])(?:\.|$)/.exec(versionSpec.trim());
+  if (match?.[1] === "3") return 3;
+  if (match?.[1] === "4") return 4;
   return undefined;
 }
 
-async function readPackageVersion(packagePath: string) {
-  try {
-    const parsed = JSON.parse(await readFile(packagePath, "utf8")) as { version?: unknown };
-    return typeof parsed.version === "string" ? parsed.version : undefined;
-  } catch {
-    return undefined;
-  }
+function isExactVersion(versionSpec: string) {
+  return /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(versionSpec);
 }
 
-async function pathExists(path: string) {
-  try {
-    await access(path, constants.F_OK);
-    return true;
-  } catch {
-    return false;
-  }
+function resolveCatalogSpec(
+  versionSpec: string,
+  dependency: string,
+  defaultCatalog: Record<string, string>,
+  namedCatalogs: Record<string, Record<string, string>>,
+) {
+  if (!versionSpec.startsWith("catalog:")) return versionSpec;
+  const catalogName = versionSpec.slice("catalog:".length).trim();
+  const catalog = catalogName ? namedCatalogs[catalogName] : defaultCatalog;
+  return catalog?.[dependency] ?? versionSpec;
 }
 
-async function directoryExists(path: string) {
+async function readWorkspaceManifest(root: string): Promise<WorkspaceManifest> {
+  const rootPackage = await readJsonRecord(join(root, "package.json"));
+  const workspaces = rootPackage?.workspaces;
+  const npmPatterns = Array.isArray(workspaces)
+    ? workspaces.filter((pattern): pattern is string => typeof pattern === "string")
+    : asRecord(workspaces)?.packages;
+  const packagePatterns = Array.isArray(npmPatterns)
+    ? npmPatterns.filter((pattern): pattern is string => typeof pattern === "string")
+    : [];
+
+  let defaultCatalog: Record<string, string> = {};
+  let namedCatalogs: Record<string, Record<string, string>> = {};
   try {
-    return (await stat(path)).isDirectory();
+    const pnpmWorkspace = asRecord(parseYaml(await readFile(join(root, "pnpm-workspace.yaml"), "utf8")));
+    const pnpmPatterns = Array.isArray(pnpmWorkspace?.packages)
+      ? pnpmWorkspace.packages.filter((pattern): pattern is string => typeof pattern === "string")
+      : [];
+    packagePatterns.push(...pnpmPatterns);
+    defaultCatalog = stringRecord(pnpmWorkspace?.catalog);
+    const catalogs = asRecord(pnpmWorkspace?.catalogs);
+    if (catalogs) {
+      namedCatalogs = Object.fromEntries(
+        Object.entries(catalogs).map(([name, catalog]) => [name, stringRecord(catalog)]),
+      );
+    }
   } catch {
-    return false;
+    // A broken workspace file leaves catalog: specs unresolved and visible in status.
   }
+
+  return { packagePatterns: normalizePatterns(packagePatterns), defaultCatalog, namedCatalogs };
 }
 
-async function findPackageJsonFiles(root: string, isGitRepo: boolean) {
-  if (!isGitRepo) {
-    const direct = join(root, "package.json");
-    return (await pathExists(direct)) ? [direct] : [];
-  }
+function normalizePatterns(patterns: string[]) {
+  return [...new Set(patterns.map((pattern) => pattern.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "")))];
+}
+
+async function findPackageJsonFiles(root: string, workspacePatterns: string[]) {
+  const direct = join(root, "package.json");
+  const files = (await pathExists(direct)) ? [direct] : [];
+  if (workspacePatterns.length === 0) return files;
+
+  const includes = workspacePatterns.filter((pattern) => !pattern.startsWith("!"));
+  const excludes = workspacePatterns.filter((pattern) => pattern.startsWith("!")).map((pattern) => pattern.slice(1));
+  if (includes.length === 0) return files;
 
   const found: string[] = [];
-  const maxDepth = 6;
-  const maxFiles = 150;
+  const maxDepth = 12;
+  const maxFiles = 1_000;
 
   async function walk(dir: string, depth: number): Promise<void> {
     if (found.length >= maxFiles || depth > maxDepth) return;
@@ -398,11 +591,71 @@ async function findPackageJsonFiles(root: string, isGitRepo: boolean) {
         if (skippedDirectories.has(entry.name)) continue;
         await walk(join(dir, entry.name), depth + 1);
       } else if (entry.isFile() && entry.name === "package.json") {
-        found.push(join(dir, entry.name));
+        const packageDirectory = relative(root, dirname(join(dir, entry.name))).split(sep).join("/");
+        const included = includes.some((pattern) => minimatch(packageDirectory, pattern, { dot: true }));
+        const excluded = excludes.some((pattern) => minimatch(packageDirectory, pattern, { dot: true }));
+        if (included && !excluded) found.push(join(dir, entry.name));
       }
     }
   }
 
   await walk(root, 0);
-  return found;
+  return [...new Set([...files, ...found])];
+}
+
+async function readAgentSourceMetadata(path: string): Promise<AgentSourceMetadata | undefined> {
+  const parsed = await readJsonRecord(path);
+  if (
+    parsed?.type !== "github-repo-source" ||
+    parsed.owner !== EFFECT_OWNER ||
+    parsed.repo !== EFFECT_REPO ||
+    parsed.remote !== EFFECT_REPO_URL ||
+    typeof parsed.ref !== "string" ||
+    typeof parsed.commit !== "string"
+  ) {
+    return undefined;
+  }
+  return parsed as unknown as AgentSourceMetadata;
+}
+
+async function readJsonRecord(path: string) {
+  try {
+    return asRecord(JSON.parse(await readFile(path, "utf8")) as unknown);
+  } catch {
+    return undefined;
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function stringRecord(value: unknown): Record<string, string> {
+  const record = asRecord(value);
+  if (!record) return {};
+  return Object.fromEntries(Object.entries(record).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+}
+
+async function readPackageVersion(packagePath: string) {
+  const parsed = await readJsonRecord(packagePath);
+  return typeof parsed?.version === "string" ? parsed.version : undefined;
+}
+
+async function pathExists(path: string) {
+  try {
+    await access(path, constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function directoryExists(path: string) {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
 }
