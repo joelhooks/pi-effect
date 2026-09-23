@@ -30,9 +30,9 @@ export interface SourceProcessAdapter {
     cwd: string;
     repoUrl: string;
     target: string;
-    branch: "main" | "v3";
+    ref: string;
     signal?: AbortSignal;
-  }): Promise<void>;
+  }): Promise<{ commit: string }>;
   search(args: {
     cwd: string;
     query: string;
@@ -126,10 +126,17 @@ export function createNodeProcessAdapter(): SourceProcessAdapter {
       return resolve(root, result.stdout.trim());
     },
 
-    async cloneShallow({ cwd, repoUrl, target, branch, signal }) {
-      const args = ["clone", "--depth", "1", "--filter=blob:none", "--branch", branch, repoUrl, target];
+    async cloneShallow({ cwd, repoUrl, target, ref, signal }) {
+      const args = ["clone", "--depth", "1", "--filter=blob:none", "--branch", ref, repoUrl, target];
       const result = await run("git", args, { cwd, signal, maxBytes: 100_000 });
       if (result.code !== 0) throw commandFailure("git", args, result, "Source clone failed");
+
+      const revParseArgs = ["-C", target, "rev-parse", "HEAD"];
+      const commitResult = await run("git", revParseArgs, { cwd, signal });
+      if (commitResult.code !== 0) {
+        throw commandFailure("git", revParseArgs, commitResult, "Unable to read source mirror commit");
+      }
+      return { commit: commitResult.stdout.trim() };
     },
 
     async search({ cwd, query, paths, globs, contextLines, maxCountPerFile, maxBytes, signal }) {

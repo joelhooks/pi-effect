@@ -23,12 +23,12 @@ export default function piEffectExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "effect_source",
     label: "Effect Source",
-    description: "Detect Effect dependencies, hydrate the official Effect source mirror, and search it for source-grounded best practices.",
-    promptSnippet: "Detect, hydrate, and search official Effect source in repos that use Effect.",
+    description: "Detect Effect dependencies, reuse or hydrate the source pinned by the project, and search it for source-grounded best practices.",
+    promptSnippet: "Check the project's Effect source ref, reuse or hydrate its mirror, and search official source.",
     promptGuidelines: [
-      "Use effect_source with action `status` when entering an unfamiliar repo that may use Effect.",
-      "Use effect_source with action `hydrate` before writing, reviewing, or refactoring Effect code if `.agent-sources/effect/` is missing.",
-      "Use effect_source with action `search` to verify current Effect APIs and patterns before calling something an Effect best practice.",
+      "Use effect_source with action `status` when entering an unfamiliar repo that may use Effect; check whether the source ref is an exact pin or a reported branch fallback.",
+      "Use effect_source with action `hydrate` before writing, reviewing, or refactoring Effect code when status reports that no usable mirror exists.",
+      "Use effect_source with action `search` to verify current Effect APIs and patterns; it rejects stale exact-version or source-ref mismatches.",
     ],
     parameters: Type.Object({
       action: StringEnum(["status", "hydrate", "search"] as const),
@@ -70,14 +70,15 @@ export default function piEffectExtension(pi: ExtensionAPI) {
 
     let hydrationNote = "";
     const mirror = await workspace.mirrorStatus(detection.root);
-    if (!mirror.ready) {
-      try {
-        await workspace.hydrate(detection, ctx.signal);
-        hydrationNote = "\n\npi-effect already hydrated `.agent-sources/effect/` for this repo.";
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        hydrationNote = `\n\npi-effect tried to hydrate \`.agent-sources/effect/\` but failed: ${message}`;
+    try {
+      await workspace.hydrate(detection, ctx.signal);
+      const ensuredMirror = await workspace.mirrorStatus(detection.root);
+      if (!mirror.ready || mirror.path !== ensuredMirror.path) {
+        hydrationNote = `\n\npi-effect ensured the Effect source mirror at ${ensuredMirror.path}.`;
       }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      hydrationNote = `\n\npi-effect could not ensure the Effect source mirror: ${message}`;
     }
 
     return {

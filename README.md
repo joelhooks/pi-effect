@@ -2,19 +2,17 @@
 
 Pi package for source-first Effect work.
 
-When a repo uses `effect` or `@effect/*`, agents should not vibe-code from stale memory. They should hydrate the official Effect source locally, search it, then write the code.
-
-This package makes that the default instead of a sticky note we hope the agent remembers. 🐀
+When a repo uses `effect` or `@effect/*`, agents should not vibe-code from stale memory. They should verify the project's source ref, search the matching Effect source, then write the code.
 
 ## What it does
 
-- Detects `effect` / `@effect/*` dependencies in `package.json` files.
-- Hydrates the official Effect repo into `.agent-sources/effect/` with a version-aware shallow clone: canonical `main` for v4, upstream `v3` for explicit v3 projects.
-- Adds `.agent-sources/` to `.git/info/exclude` so the mirror stays out of product commits.
+- Detects `effect` / `@effect/*` dependencies in the root package and declared npm, Bun, or pnpm workspace packages. It resolves pnpm `catalog:` pins and ignores source mirrors.
+- Reuses the rat-stack source mirror at `.agent_sources/github.com/Effect-TS/effect/`, including its `.agent-source.json` ref metadata.
+- Hydrates an exact Effect pin from the matching `effect@<version>` tag. If the project has only a version range, it falls back to `main` for v4 or `v3` for v3 and reports that the source is not an exact match. Unresolved aliases such as `latest` cannot select a source ref.
+- Reads the legacy `.agent-sources/effect/` layout when the canonical mirror is absent. If that legacy source is stale for the project pin, it creates a canonical copy beside it and leaves the old mirror untouched.
+- Adds `.agent-source/`, `.agent-sources/`, and `.agent_sources/` to `.git/info/exclude` so local source mirrors stay out of product commits.
 - Injects a source-first Effect rule into Pi's system prompt when the current repo uses Effect.
-- Provides an `effect_source` tool for status, hydrate, and source search.
-- Provides `/effect-source` for manual operator use.
-- Ships a `pi-effect` skill with the same workflow in plain instructions.
+- Provides an `effect_source` tool for status, hydrate, and source search, plus `/effect-source` for manual operator use.
 
 ## Install
 
@@ -32,21 +30,23 @@ pi install git:github.com/joelhooks/pi-effect
 
 ## Commands
 
-```bash
+```text
 /effect-source status
 /effect-source hydrate
 /effect-source search Effect.fn
 ```
 
+The status output reports the expected source ref, whether it came from an exact pin or a major-branch fallback, the selected mirror layout, mirror metadata, and the Effect package version. A source-ref or version mismatch blocks search. Hydration does not overwrite an existing mirror.
+
 ## Agent tool
 
 The extension registers `effect_source`:
 
-- `status` - report dependency specs, expected source branch, mirror readiness, mirror Effect version, and major mismatches
-- `hydrate` - clone `.agent-sources/effect/` from canonical `main` for v4 or upstream `v3` for explicit v3 projects, then exclude it locally
-- `search` - run `rg` against the Effect source mirror and refuse a known major mismatch or unresolved floating spec
+- `status` - report project dependency specs, expected source ref, exact/fallback mode, mirror readiness, metadata ref, and Effect version
+- `hydrate` - reuse a matching mirror or shallow-clone the project's exact `effect@<version>` tag into `.agent_sources/github.com/Effect-TS/effect/`; branch fallbacks are reported
+- `search` - run `rg` against the selected Effect source mirror and reject stale exact-version or source-ref mismatches
 
-## Source-first repo setup
+## Source mirrors in this repo
 
 This package itself is Pi extension code, so Pi source is the source of truth for extension APIs.
 
@@ -57,32 +57,20 @@ mkdir -p .agent-source
 git clone --depth 1 --filter=blob:none https://github.com/earendil-works/pi-mono.git .agent-source/pi
 ```
 
-Keep it out of commits:
+Keep it and the Effect mirror out of commits:
 
 ```bash
-printf '%s\n' '.agent-source/' '.agent-sources/' >> .git/info/exclude
+printf '%s\n' '.agent-source/' '.agent-sources/' '.agent_sources/' >> .git/info/exclude
 ```
 
-Do not add those mirrors to `.gitignore` unless we want to make the convention visible to users. For this repo, they are local agent working material.
+Do not add those mirrors to `.gitignore` unless we want to make the convention visible to users. They are local agent working material.
 
-## Effect source rule
+## Effect source workflow
 
-When working in any repo that uses Effect:
-
-1. Check `.agent-sources/effect/`.
-2. If missing, shallow clone the official source:
-
-   ```bash
-   mkdir -p .agent-sources
-   # Effect v4
-   git clone --depth 1 --filter=blob:none --branch main https://github.com/effect-ts/effect.git .agent-sources/effect
-
-   # Effect v3 projects use --branch v3 instead.
-   ```
-
-3. Pin Effect exactly. Floating aliases such as `latest` cannot choose a trustworthy source branch offline.
-4. Add `.agent-sources/` to `.git/info/exclude`.
-4. Search `packages/effect/src/`, tests, and examples before claiming anything is an Effect best practice.
+1. Run `effect_source` with action `status` and check the dependency spec, expected ref, mirror metadata, and any warning.
+2. Exact pins use the matching upstream tag, such as `effect@4.0.0-rc.117`. If the project has a range, pi-effect may use `main` or `v3` as a major-only fallback; status says this is not an exact match. Floating aliases with no detectable major are unresolved.
+3. Use action `hydrate` if the matching mirror is missing. pi-effect writes the same `.agent-source.json` metadata rat-stack writes. A stale or conflicting mirror is left untouched and reported.
+4. Search source, tests, and examples before calling anything an Effect best practice.
 
 ## GitHub actor note
 
@@ -91,8 +79,8 @@ Agent-authored GitHub commits, issue comments, and PR reviews should come from [
 ## Architecture
 
 - `extensions/pi-effect.ts` is the Pi Adapter. It registers the tool, command, and prompt injection.
-- `extensions/effect-source-workspace.ts` is the Effect source workspace Module. It owns detection, mirror status, hydration, search, and repo-root keyed coordination.
-- `extensions/process-adapter.ts` is the Process Adapter seam for `git` and `rg`.
+- `extensions/effect-source-workspace.ts` owns Effect dependency detection, workspace and catalog resolution, mirror status, hydration, search, and repo-root keyed coordination.
+- `extensions/process-adapter.ts` is the Process Adapter seam for `git` and `rg` operations.
 
 ## Development
 

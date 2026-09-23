@@ -41,6 +41,10 @@
       "./skills"
     ]
   },
+  "dependencies": {
+    "minimatch": "10.2.6",
+    "yaml": "2.9.0"
+  },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
